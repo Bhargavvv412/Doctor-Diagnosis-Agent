@@ -14,6 +14,7 @@ import os
 import requests
 from io import BytesIO
 import json
+import openai
 
 
 
@@ -38,14 +39,13 @@ except ImportError:
 
 def process_file(uploaded_file):
     """Process differnet file types"""
-    file_extension = uploaded_file.name.split('.')[-1].lower()
+    ext = uploaded_file.name.split('.')[-1].lower()
 
-    if file_extension in ['jpg','jpeg','png']:
+    if ext in ['jpg','jpeg','png']:
         
-        image = Image.open(uploaded_file)
+        image = Image.open(uploaded_file).convert('RGB')
         return {"type":"image","data":image,"array":np.array(image)}
-    
-    elif file_extension in ['dcm'] and PYDICOM_AVAILABLE:
+    elif ext in ['dcm'] and PYDICOM_AVAILABLE:
         try:
             bytes_data = uploaded_file.getvalue()
             with io.BytesIO(bytes_data) as dcm_bytes:
@@ -70,7 +70,7 @@ def process_file(uploaded_file):
             print(f"Error processing DICOM : {e}")
             return None
         
-    elif file_extension in ['nii','nii.gz'] and NIBABEL_AVAILABLE:
+    elif ext in ['nii','nii.gz'] and NIBABEL_AVAILABLE:
         #NIfTI FILE (3D Scan)
         try:
             bytes_data = uploaded_file.get_value()
@@ -108,7 +108,7 @@ def process_file(uploaded_file):
             print(f"Error processing NIfTI: {e}")
             return None
         
-    elif file_extension in ['dcm','nii','nii.gz']:
+    elif ext in ['dcm','nii','nii.gz']:
         return{
             "type":"image",
             "data": Image.new('RGB',(400,400),color='gray'),
@@ -121,3 +121,142 @@ def process_file(uploaded_file):
     else:
         return None
     
+
+def generate_heatmap(image_array):
+    if len(image_array.shape) ==3:
+        gray_image = cv2.cvtColor(image_array,cv2.COLOR_RGB2GRAY)
+    else:
+        gray_image = image_array
+
+    heatmap = cv2.applyColorMap(gray_image,cv2.COLORMAP_JET)
+
+    if len(image_array.shape) == 2:
+        image_array = cv2.cvtColor(image_array,cv2.COLOR_GRAY2RGB)
+
+        overlay = cv2.addWeighted(heatmap,0.5,image_array,0.5,0)
+    
+    return Image.fromarray(overlay),Image.fromarray(heatmap)
+
+
+def extract_findings_and_keywords(analysis_text):
+    findings = []
+    keywords = []
+
+    # --- Extract Findings ---
+    if "Impression" in analysis_text:
+        # Split after "Impression:"
+        impression_section = analysis_text.split("Impression")[1].strip()
+        numbered_items = impression_section.split("\n")
+
+        for item in numbered_items:
+            item = item.strip()
+            if item and (item[0].isdigit() or item[0] in ['-', '*']):
+                # Remove number or bullet
+                clean_item = item.lstrip("0123456789.-* )").strip()
+                if clean_item:
+                    findings.append(clean_item)
+
+    # --- Keyword extraction ---
+    base_keywords = [
+        "chest x-ray",
+        "bilateral infiltrates",
+        "lower lobes",
+        "ground-glass opacities",
+        "right lower lobe consolidation",
+        "cardiomegaly",
+        "no pneumothorax",
+        "no pleural effusion",
+        "pulmonary infection",
+        "pneumonia",
+        "viral pneumonia",
+        "atypical infection",
+        "COVID-19",
+        "lungs",
+        "heart enlargement",
+        "radiology",
+        "imaging findings"
+    ]
+
+    # Check which ones are present in the text
+    for term in base_keywords:
+        if term.lower() in analysis_text.lower():
+            keywords.append(term)
+
+    keywords = list(dict.fromkeys(keywords))
+
+    return findings, keywords[:5]
+
+def analyze_image(image,api_key,enable_xai=True):
+
+    buffered = io.BytesIO()
+    image.save(buffered,format="PNG")
+    encoded_image = base64.b64encode(buffered.getvalue()).decode()
+
+    client = openai.OpenAI(api_key=api_key)
+
+    prompt = """
+    You are an expert radiologist. Analyze the provided medical image carefully.
+
+    Provide a detailed structured report including:
+    1. **Radiological Findings:** Describe all visible abnormalities.
+    2. **Impression:** Summarize the key findings (e.g., pneumonia, cardiomegaly, fractures, tumors).
+    3. **Possible Diagnoses:** Suggest possible conditions based on findings.
+    4. **Recommendations:** Suggest follow-up actions (e.g., CT scan, clinical correlation).
+
+    Format your respose with "Radiological Analysis " and "Impression" sections.
+    """
+
+    try:
+        respose = client.chat.completions.create(
+            model="chatgpt-4o-turbo",
+            messages=[{
+                "role":"user",
+                "content":[
+                    {
+                        "type":"text",
+                        "text":prompt
+                     },
+                     {
+                         "type":"image_url",
+                         "image_url":{"url":f"data:image/png;base64,{encoded_image}"}
+                     }
+                ]
+            }],
+            max_tokens=800,
+        )
+
+        analysis = respose.choices[0].message.content
+
+        findings,keywords = extract_findings_and_keywords(analysis)
+
+        return{
+            "id":str(uuid.uuid4()),
+            "analysis":analysis,
+            "finding":findings,
+            "keywords":keywords,
+            "date":datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        return{
+            "id":str(uuid.uuid4()),
+            "analysis":f"Error analyzing image: {str(e)}",
+            "finding":[],
+            "keywords":[],
+            "date":datetime.now().isoformat()
+        }
+    
+def search_pubmed(keyword,max_result=5):
+    if not keyword:
+        return []
+    
+    query = 'AND'.join(keyword)
+
+    try:
+        handle = Entrez.esearch(db="pubmed",term=query,retmax=max_result)
+        result = Entrez.read(handle)
+
+        if not result["IdList"]:
+            return []
+        
+        fetch_handle  = Entrez.efetch(db="pubmed",id=result["IdList"],ret)
