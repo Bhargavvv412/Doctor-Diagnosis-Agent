@@ -83,5 +83,41 @@ def process_file(uploaded_file):
                 #Load the NIfTI file
                 nii_img = nib.load(temp_path)
                 nii_data = nii_img.get_fdata()
+
+                #Take a middle slice preview
+                middle_slice = nii_data.shape[2] //2 
+                image_array = nii_data[:,:,middle_slice]
+
+                #Normalize for display
+                image_array = ((image_array-image_array.min())/
+                               (image_array.max()-image_array.min())*255).astype(np.uint8)
+                
+                #Clean temp
+                os.remove(temp_path)
+
+                return{
+                    "type":"nifti",
+                    "data":Image.fromarray(image_array),
+                    "array": image_array,
+                    "metadata":{
+                        "Dimensions": nii_data.shape,
+                        "Voxel Size": nii_img.header.get_zooms()
+                    }
+                }
         except Exception as e:
+            print(f"Error processing NIfTI: {e}")
             return None
+        
+    elif file_extension in ['dcm','nii','nii.gz']:
+        return{
+            "type":"image",
+            "data": Image.new('RGB',(400,400),color='gray'),
+            "array":np.zeros((400,400,3),dtype=np.uint8),
+            "metadata":{
+                "Warning":"required libraries not installed for this file type",
+                "Missing":"Install pydicom or nibabel to process this file"
+            }
+        }
+    else:
+        return None
+    
